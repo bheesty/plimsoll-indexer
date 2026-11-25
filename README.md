@@ -22,6 +22,7 @@ One Go binary with five jobs and an HTTP API:
 | **State reconciler** | Reads each listed asset's `get_supply` and `get_report` back from the coverage ledger and stores anything newer than ingestion has. RPC serves only about seven days of events, so a longer ingestion gap cannot be repaired from events; the contracts always hold the latest figure. Recovered rows are marked `"source": "chain"` and carry no `tx_hash`. Reading is simulation, so it needs no key and runs even on an instance that cannot sign. |
 | **stellar.toml sync** | Resolves each issuer's `home_domain`, reads its SEP-1 `stellar.toml`, and stores the matching `[[CURRENCIES]]` entry, including `attestation_of_reserve`. |
 | **Retention** | Nightly, deletes supply snapshots, reserve reports and unreferenced breakdowns older than `RETENTION_DAYS`, then vacuums the affected tables. `0` keeps everything forever. |
+| **stellar.toml sync** | Resolves each issuer's `home_domain`, reads its SEP-1 `stellar.toml`, and stores the matching `[[CURRENCIES]]` entry, including `attestation_of_reserve`. Successful fetches are SHA-256 tracked per issuer; changes are logged and can be delivered to registered webhooks. |
 
 **Live API:** https://plimsoll-indexer.onrender.com/v1/assets  
 **Docs:** https://plimsoll-protocol.gitbook.io/plimsoll-protocol-docs/
@@ -68,6 +69,10 @@ The command fetches the asset's snapshot breakdown from the indexer, verifies th
 | `GET /v1/reporters` | Active registered reporters |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
 | `POST /graphql` | Optional GraphQL endpoint. Off unless `ENABLE_GRAPHQL=true`; introspection is disabled when `ENVIRONMENT=production`. |
+| `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |
+
+Webhook registration and signature verification are covered in the
+[webhook guide](docs/webhooks.md).
 
 Coverage in the API uses the same selection and rounding rules as the contract
 (`internal/coverage`), so the API and `coverage()` on-chain agree.

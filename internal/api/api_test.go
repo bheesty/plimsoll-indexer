@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -12,13 +13,31 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stellar/go-stellar-sdk/strkey"
+
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/webhook"
 )
 
 var now = time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
 
 const sac = "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+
+// breakdownHash is what a SHA-256 breakdown hash looks like: 64 hex characters.
+var breakdownHash = strings.Repeat("a", 64)
+
+// unlistedSAC is a well-formed contract strkey that fake holds no asset for.
+func unlistedSAC(t *testing.T) string {
+	t.Helper()
+	raw := make([]byte, 32)
+	raw[0] = 0x01
+	s, err := strkey.Encode(strkey.VersionByteContract, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
 
 type fake struct {
 	assets  []coverage.Asset
@@ -79,7 +98,38 @@ func (f *fake) Progress(context.Context, string) (store.Progress, error) {
 	}, nil
 }
 
+type webhookManagerFake struct {
+	webhooks []store.Webhook
+}
+
+func (f *webhookManagerFake) CreateWebhook(_ context.Context, url, hash string, ciphertext []byte) (store.Webhook, error) {
+	item := store.Webhook{
+		ID: int64(len(f.webhooks) + 1), URL: url, SecretHash: hash,
+		SecretCiphertext: ciphertext, CreatedAt: now,
+	}
+	f.webhooks = append(f.webhooks, item)
+	return item, nil
+}
+
+func (f *webhookManagerFake) ListWebhooks(context.Context) ([]store.Webhook, error) {
+	return f.webhooks, nil
+}
+
+func (f *webhookManagerFake) DeleteWebhook(_ context.Context, id int64) (bool, error) {
+	for i, item := range f.webhooks {
+		if item.ID == id {
+			f.webhooks = append(f.webhooks[:i], f.webhooks[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func server() *httptest.Server {
+	return serverWithWebhooks(nil, nil, "")
+}
+
+func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, token string) *httptest.Server {
 	f := &fake{
 		assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}},
 		supply: map[string]*coverage.Supply{
@@ -91,13 +141,16 @@ func server() *httptest.Server {
 				AsOf: now.Add(-2 * time.Hour), Reporter: "GISS", DocURI: "https://x",
 			}},
 		},
-		bodies: map[string][]byte{"abc": []byte(`{"total":"1"}`)},
+		bodies: map[string][]byte{breakdownHash: []byte(`{"total":"1"}`)},
 	}
 	s := &Server{
-		Store: f,
-		CORS:  []string{"*"},
-		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Now:   func() time.Time { return now },
+		Store:             f,
+		WebhookStore:      manager,
+		WebhookCodec:      codec,
+		WebhookAdminToken: token,
+		CORS:              []string{"*"},
+		Log:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:               func() time.Time { return now },
 	}
 	return httptest.NewServer(s.Handler())
 }
@@ -150,7 +203,7 @@ func TestListAndMisc(t *testing.T) {
 	if len(list["assets"].([]any)) != 1 {
 		t.Fatal("expected one asset")
 	}
-	get(t, srv, "/v1/assets/CNOPE", 404)
+	get(t, srv, "/v1/assets/CNOPE", 400)
 	rep := get(t, srv, "/v1/reporters", 200)
 	if rep["reporters"].([]any)[0].(map[string]any)["role"] != "auditor" {
 		t.Fatal("role name missing")
@@ -174,7 +227,7 @@ func TestListAndMisc(t *testing.T) {
 func TestBreakdownServedVerbatim(t *testing.T) {
 	srv := server()
 	defer srv.Close()
-	resp, err := http.Get(srv.URL + "/v1/breakdowns/abc")
+	resp, err := http.Get(srv.URL + "/v1/breakdowns/" + breakdownHash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +236,59 @@ func TestBreakdownServedVerbatim(t *testing.T) {
 	if string(b) != `{"total":"1"}` {
 		t.Fatalf("body %q", b)
 	}
-	get(t, srv, "/v1/breakdowns/zzz", 404)
+	get(t, srv, "/v1/breakdowns/"+strings.Repeat("0", 64), 404)
+}
+
+// Every path id is checked before it reaches storage: malformed ids are a
+// client error, while well-formed but unlisted ids are a missing resource.
+func TestMalformedPathIDs(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	for _, path := range []string{
+		"/v1/assets/not-a-sac",
+		"/v1/assets/CNOPE",
+		"/v1/assets/not-a-sac/supply",
+		"/v1/assets/not-a-sac/reports",
+	} {
+		body := get(t, srv, path, 400)
+		if body["error"] == nil {
+			t.Errorf("%s: expected an error message, got %+v", path, body)
+		}
+	}
+	for _, hash := range []string{"abc", strings.Repeat("a", 63), strings.Repeat("z", 64)} {
+		body := get(t, srv, "/v1/breakdowns/"+hash, 400)
+		if body["error"] == nil {
+			t.Errorf("hash %q: expected an error message, got %+v", hash, body)
+		}
+	}
+}
+
+func TestUnlistedPathIDs(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	unknown := unlistedSAC(t)
+	for _, path := range []string{
+		"/v1/assets/" + unknown,
+		"/v1/assets/" + unknown + "/supply",
+		"/v1/assets/" + unknown + "/reports",
+	} {
+		body := get(t, srv, path, 404)
+		if body["error"] != "asset not listed" {
+			t.Errorf("%s: body %+v", path, body)
+		}
+	}
+}
+
+// A listed asset keeps answering 200 from both history endpoints.
+func TestListedAssetHistory(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	if got := get(t, srv, "/v1/assets/"+sac+"/supply", 200)["supply"].([]any); len(got) != 1 {
+		t.Fatalf("supply history %+v", got)
+	}
+	if got := get(t, srv, "/v1/assets/"+sac+"/reports", 200)["reports"].([]any); len(got) != 1 {
+		t.Fatalf("report history %+v", got)
+	}
 }
 
 func TestCORSHeader(t *testing.T) {
@@ -254,5 +359,72 @@ func TestGraphQLRouteIsOptional(t *testing.T) {
 	srv.Close()
 	if !called || resp.StatusCode != http.StatusOK {
 		t.Fatalf("enabled /graphql called=%v status=%d", called, resp.StatusCode)
+func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
+	manager := &webhookManagerFake{}
+	codec, err := webhook.NewSecretCodec(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := serverWithWebhooks(manager, codec, "admin-token")
+	defer srv.Close()
+
+	request := func(method, path, body string, authorized bool) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if authorized {
+			req.Header.Set("Authorization", "Bearer admin-token")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	unauthorized := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, false)
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized create status = %d, want 401", unauthorized.StatusCode)
+	}
+
+	created := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, true)
+	defer created.Body.Close()
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", created.StatusCode)
+	}
+	var response struct {
+		ID     int64  `json:"id"`
+		Secret string `json:"secret"`
+	}
+	if err := json.NewDecoder(created.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Secret == "" || len(manager.webhooks) != 1 {
+		t.Fatalf("creation response %q, stored webhooks %d", response.Secret, len(manager.webhooks))
+	}
+	stored := manager.webhooks[0]
+	if stored.SecretHash != webhook.SecretHash(response.Secret) {
+		t.Fatal("stored secret hash does not match the one-time returned secret")
+	}
+	decrypted, err := codec.Decrypt(stored.SecretCiphertext)
+	if err != nil || decrypted != response.Secret {
+		t.Fatalf("stored signing secret = %q, %v", decrypted, err)
+	}
+
+	list := request(http.MethodGet, "/v1/webhooks", "", true)
+	defer list.Body.Close()
+	listBody, err := io.ReadAll(list.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list.StatusCode != http.StatusOK || strings.Contains(string(listBody), response.Secret) ||
+		strings.Contains(string(listBody), "secret_hash") || strings.Contains(string(listBody), "secret_ciphertext") {
+		t.Fatalf("list response disclosed secret or failed: status=%d body=%s", list.StatusCode, listBody)
 	}
 }

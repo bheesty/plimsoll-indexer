@@ -3,17 +3,24 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/stellar/go-stellar-sdk/strkey"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/webhook"
 )
 
 //go:embed openapi.yaml
@@ -51,6 +58,20 @@ type Server struct {
 	// GraphQL, when set, is mounted at /graphql. It is nil unless
 	// ENABLE_GRAPHQL=true.
 	GraphQL http.Handler
+	Store             Reader
+	WebhookStore      WebhookManager
+	WebhookAdminToken string
+	WebhookCodec      *webhook.SecretCodec
+	Network           NetworkInfo
+	CORS              []string
+	Log               *slog.Logger
+	Now               func() time.Time
+}
+
+type WebhookManager interface {
+	CreateWebhook(context.Context, string, string, []byte) (store.Webhook, error)
+	ListWebhooks(context.Context) ([]store.Webhook, error)
+	DeleteWebhook(context.Context, int64) (bool, error)
 }
 
 func (s *Server) Handler() http.Handler {
@@ -67,6 +88,9 @@ func (s *Server) Handler() http.Handler {
 	if s.GraphQL != nil {
 		mux.Handle("/graphql", s.GraphQL)
 	}
+	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
+	mux.HandleFunc("GET /v1/webhooks", s.listWebhooks)
+	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
 	return s.cors(mux)
 }
 
@@ -110,6 +134,17 @@ type assetJSON struct {
 type reporterJSON struct {
 	Role string `json:"role"`
 	coverage.Reporter
+}
+
+type webhookJSON struct {
+	ID        int64     `json:"id"`
+	URL       string    `json:"url"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type createdWebhookJSON struct {
+	webhookJSON
+	Secret string `json:"secret"`
 }
 
 func toSupply(sp *coverage.Supply) *supplyJSON {
@@ -211,11 +246,15 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getAsset(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
 	minTier, ok := parseTier(w, r)
 	if !ok {
 		return
 	}
-	a, err := s.Store.GetAsset(r.Context(), r.PathValue("sac"))
+	a, err := s.Store.GetAsset(r.Context(), sac)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "asset not listed")
 		return
@@ -258,11 +297,18 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 }
 
 func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
 	limit, ok := parseLimit(w, r)
 	if !ok {
 		return
 	}
-	list, err := s.Store.SupplyHistory(r.Context(), r.PathValue("sac"), limit)
+	if !s.requireAsset(w, r, sac) {
+		return
+	}
+	list, err := s.Store.SupplyHistory(r.Context(), sac, limit)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -275,11 +321,18 @@ func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) reportHistory(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
 	limit, ok := parseLimit(w, r)
 	if !ok {
 		return
 	}
-	list, err := s.Store.ReportHistory(r.Context(), r.PathValue("sac"), limit)
+	if !s.requireAsset(w, r, sac) {
+		return
+	}
+	list, err := s.Store.ReportHistory(r.Context(), sac, limit)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -305,7 +358,12 @@ func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
-	body, err := s.Store.Breakdown(r.Context(), r.PathValue("hash"))
+	hash := r.PathValue("hash")
+	if !isBreakdownHash(hash) {
+		writeError(w, http.StatusBadRequest, "hash must be 64 hex characters")
+		return
+	}
+	body, err := s.Store.Breakdown(r.Context(), hash)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "unknown breakdown hash")
 		return
@@ -320,7 +378,146 @@ func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4097))
+	if err != nil || len(body) > 4096 {
+		writeError(w, http.StatusBadRequest, "request body must be valid JSON under 4KB")
+		return
+	}
+	var input struct {
+		URL string `json:"url"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeError(w, http.StatusBadRequest, "request body must contain a webhook URL")
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "request body must contain one JSON object")
+		return
+	}
+	if err := webhook.ValidateURL(input.URL); err != nil {
+		writeError(w, http.StatusBadRequest, "url must be a valid HTTPS URL")
+		return
+	}
+	secret, err := webhook.GenerateSecret()
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	ciphertext, err := s.WebhookCodec.Encrypt(secret)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	created, err := s.WebhookStore.CreateWebhook(r.Context(), input.URL, webhook.SecretHash(secret), ciphertext)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, createdWebhookJSON{
+		webhookJSON: webhookJSON{ID: created.ID, URL: created.URL, CreatedAt: created.CreatedAt},
+		Secret:      secret,
+	})
+}
+
+func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request) {
+	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+		return
+	}
+	webhooks, err := s.WebhookStore.ListWebhooks(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := make([]webhookJSON, 0, len(webhooks))
+	for _, item := range webhooks {
+		out = append(out, webhookJSON{ID: item.ID, URL: item.URL, CreatedAt: item.CreatedAt})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"webhooks": out})
+}
+
+func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id < 1 {
+		writeError(w, http.StatusBadRequest, "webhook id must be a positive integer")
+		return
+	}
+	deleted, err := s.WebhookStore.DeleteWebhook(r.Context(), id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	if !deleted {
+		writeError(w, http.StatusNotFound, "webhook not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) webhookConfigured(w http.ResponseWriter) bool {
+	if s.WebhookStore == nil || s.WebhookCodec == nil || s.WebhookAdminToken == "" {
+		writeError(w, http.StatusServiceUnavailable, "webhook management is not configured")
+		return false
+	}
+	return true
+}
+
+func (s *Server) authorizeWebhookAdmin(w http.ResponseWriter, r *http.Request) bool {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if token == r.Header.Get("Authorization") || len(token) != len(s.WebhookAdminToken) ||
+		subtle.ConstantTimeCompare([]byte(token), []byte(s.WebhookAdminToken)) != 1 {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return false
+	}
+	return true
+}
+
 // ---- helpers --------------------------------------------------------------
+
+// parseSAC reads the {sac} path value and rejects anything that is not a
+// contract strkey, so unlisted ids answer 404 instead of passing arbitrary
+// strings through to storage.
+func parseSAC(w http.ResponseWriter, r *http.Request) (string, bool) {
+	sac := r.PathValue("sac")
+	if !strkey.IsValidContractAddress(sac) {
+		writeError(w, http.StatusBadRequest, "sac must be a contract strkey")
+		return "", false
+	}
+	return sac, true
+}
+
+// requireAsset answers 404 unless the asset is listed, so its history
+// endpoints match /v1/assets/{sac} instead of returning an empty list.
+func (s *Server) requireAsset(w http.ResponseWriter, r *http.Request, sac string) bool {
+	_, err := s.Store.GetAsset(r.Context(), sac)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "asset not listed")
+		return false
+	}
+	if err != nil {
+		s.fail(w, err)
+		return false
+	}
+	return true
+}
+
+// isBreakdownHash reports whether hash is a SHA-256 digest in hex.
+func isBreakdownHash(hash string) bool {
+	if len(hash) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(hash)
+	return err == nil
+}
 
 func parseTier(w http.ResponseWriter, r *http.Request) (uint32, bool) {
 	v := r.URL.Query().Get("min_tier")
@@ -360,6 +557,8 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

@@ -169,6 +169,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 	wantVersions := embeddedVersions(t)
 	if got := appliedVersions(t, fresh); !slices.Equal(got, wantVersions) {
 		t.Fatalf("fresh database recorded %v, want %v", got, wantVersions)
+	if got := appliedVersions(t, fresh); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("fresh database recorded %v, want [1 2 3]", got)
 	}
 
 	for name, schema := range map[string]string{
@@ -193,6 +195,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			}
 			if got := appliedVersions(t, url); !slices.Equal(got, wantVersions) {
 				t.Fatalf("recorded %v, want %v", got, wantVersions)
+			if got := appliedVersions(t, url); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+				t.Fatalf("recorded %v, want [1 2 3]", got)
 			}
 			a, err := s.GetAsset(context.Background(), "CSAC")
 			if err != nil || a.Code != "PUSD" {
@@ -216,6 +220,8 @@ func TestReopeningAppliesNothingTwice(t *testing.T) {
 	want := embeddedVersions(t)
 	if got := appliedVersions(t, url); !slices.Equal(got, want) {
 		t.Fatalf("recorded %v, want %v", got, want)
+	if got := appliedVersions(t, url); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("recorded %v, want [1 2 3]", got)
 	}
 }
 
@@ -250,6 +256,8 @@ func TestConcurrentStartsDoNotRace(t *testing.T) {
 	want := embeddedVersions(t)
 	if got := appliedVersions(t, url); !slices.Equal(got, want) {
 		t.Fatalf("recorded %v, want %v", got, want)
+	if got := appliedVersions(t, url); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("recorded %v, want [1 2 3]", got)
 	}
 }
 
