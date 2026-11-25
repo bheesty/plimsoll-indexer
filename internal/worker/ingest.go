@@ -14,7 +14,9 @@ import (
 )
 
 const (
-	cursorName = "plimsoll-events"
+	// CursorName is the ingest cursor the indexer resumes from.
+	CursorName = "plimsoll-events"
+	cursorName = CursorName
 	pageLimit  = 200
 )
 
@@ -37,6 +39,10 @@ type Ingester struct {
 	ContractIDs []string
 	StartLedger uint32
 	Log         *slog.Logger
+	// OnProgress, when set, is called after each page with the ledger the
+	// scan has reached. Reindex uses it to report progress every 1 000
+	// ledgers; normal ingestion leaves it nil.
+	OnProgress func(scannedLedger uint32)
 }
 
 // Run pulls every available page once. Call it on a ticker.
@@ -93,6 +99,11 @@ func (in *Ingester) Run(ctx context.Context) error {
 		}
 		if err := in.Store.ApplyEvents(ctx, cursorName, resp.Cursor, resp.LatestLedger, decoded); err != nil {
 			return fmt.Errorf("apply events: %w", err)
+		}
+		if in.OnProgress != nil {
+			if c, err := protocol.ParseCursor(resp.Cursor); err == nil {
+				in.OnProgress(c.Ledger)
+			}
 		}
 		if len(decoded) > 0 {
 			in.Log.Info("ingested events", "count", len(decoded), "latest_ledger", resp.LatestLedger)

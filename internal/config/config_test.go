@@ -131,6 +131,18 @@ func TestLoadDefaults(t *testing.T) {
 	if got.KeepAwakeInterval.String() != "10m0s" {
 		t.Errorf("KeepAwakeInterval = %v, want 10m0s", got.KeepAwakeInterval)
 	}
+	if got.RetentionDays != 365 {
+		t.Errorf("RetentionDays = %d, want 365", got.RetentionDays)
+	}
+	if got.Environment != "development" {
+		t.Errorf("Environment = %q, want development", got.Environment)
+	}
+	if got.GraphQLEnabled {
+		t.Error("GraphQLEnabled = true, want false by default")
+	}
+	if got.IsProduction() {
+		t.Error("IsProduction() = true, want false by default")
+	}
 }
 
 // TestLoadRequiredMissing checks that each required variable produces an error
@@ -298,4 +310,72 @@ func TestPostingEnabled(t *testing.T) {
 	if !got.PostingEnabled() {
 		t.Error("PostingEnabled() = false with SUPPLY_POSTER_SECRET set, want true")
 	}
+}
+
+func TestRetentionDaysAndGraphQL(t *testing.T) {
+	t.Run("zero keeps forever", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("RETENTION_DAYS", "0")
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.RetentionDays != 0 {
+			t.Errorf("RetentionDays = %d, want 0", got.RetentionDays)
+		}
+	})
+	t.Run("custom window", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("RETENTION_DAYS", "30")
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.RetentionDays != 30 {
+			t.Errorf("RetentionDays = %d, want 30", got.RetentionDays)
+		}
+	})
+	t.Run("negative rejected", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("RETENTION_DAYS", "-1")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "RETENTION_DAYS") {
+			t.Fatalf("want RETENTION_DAYS error, got %v", err)
+		}
+	})
+	t.Run("malformed rejected", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("RETENTION_DAYS", "soon")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "RETENTION_DAYS") {
+			t.Fatalf("want RETENTION_DAYS error, got %v", err)
+		}
+	})
+	t.Run("graphql opt in", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("ENABLE_GRAPHQL", "true")
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.GraphQLEnabled {
+			t.Error("GraphQLEnabled = false, want true")
+		}
+	})
+	t.Run("graphql malformed", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("ENABLE_GRAPHQL", "yes please")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "ENABLE_GRAPHQL") {
+			t.Fatalf("want ENABLE_GRAPHQL error, got %v", err)
+		}
+	})
+	t.Run("production", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("ENVIRONMENT", "production")
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.IsProduction() {
+			t.Error("IsProduction() = false, want true")
+		}
+	})
 }

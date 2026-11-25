@@ -19,6 +19,7 @@ import (
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/api"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/config"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/graphql"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/stellartoml"
@@ -32,6 +33,9 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		os.Exit(runHealthcheck())
+	}
+	if len(os.Args) > 1 && os.Args[1] == "reindex" {
+		os.Exit(runReindexCommand(os.Args[2:]))
 	}
 
 	cfg, err := config.Load()
@@ -97,6 +101,19 @@ func run(cfg config.Config, log *slog.Logger) error {
 	// Checks every minute; each asset is refreshed once per TOML_INTERVAL.
 	go every(ctx, time.Minute, log.With("job", "toml"), tomlSync.Run)
 
+	if cfg.RetentionDays > 0 {
+		retention := &worker.Retention{
+			Store: db,
+			Days:  cfg.RetentionDays,
+			Log:   log.With("job", "retention"),
+			Now:   time.Now,
+		}
+		log.Info("retention enabled", "days", cfg.RetentionDays)
+		go every(ctx, 24*time.Hour, log.With("job", "retention"), retention.Run)
+	} else {
+		log.Info("retention disabled (RETENTION_DAYS=0)")
+	}
+
 	if cfg.KeepAwakeURL != "" {
 		keepAwake := worker.NewKeepAwake(cfg.KeepAwakeURL)
 		kaLog := log.With("job", "keepawake")
@@ -147,6 +164,14 @@ func run(cfg config.Config, log *slog.Logger) error {
 		log.Info("supply posting disabled (SUPPLY_POSTER_SECRET not set)")
 	}
 
+	var graphqlHandler http.Handler
+	if cfg.GraphQLEnabled {
+		graphqlHandler = graphql.NewHandler(db, cfg.IsProduction())
+		log.Info("graphql enabled", "introspection", !cfg.IsProduction())
+	} else {
+		log.Info("graphql disabled (ENABLE_GRAPHQL not set)")
+	}
+
 	srv := &http.Server{
 		Addr: ":" + cfg.Port,
 		Handler: (&api.Server{
@@ -158,9 +183,10 @@ func run(cfg config.Config, log *slog.Logger) error {
 				CoverageLedgerID:   cfg.CoverageLedgerID,
 				ReporterRegistryID: cfg.ReporterRegistryID,
 			},
-			CORS: cfg.CORSOrigins,
-			Log:  log.With("component", "api"),
-			Now:  time.Now,
+			CORS:    cfg.CORSOrigins,
+			Log:     log.With("component", "api"),
+			Now:     time.Now,
+			GraphQL: graphqlHandler,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

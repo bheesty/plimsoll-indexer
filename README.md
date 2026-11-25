@@ -13,7 +13,7 @@
 # Plimsoll indexer
 
 The off-chain half of [Plimsoll](https://github.com/plimsoll-protocol/plimsoll-contracts).
-One Go binary with four jobs and an HTTP API:
+One Go binary with five jobs and an HTTP API:
 
 | Job | What it does |
 | --- | --- |
@@ -21,6 +21,7 @@ One Go binary with four jobs and an HTTP API:
 | **Event ingester** | Reads `asset_listed`, `supply_posted`, `reserve_posted`, `reporter_set` and `reporter_revoked` from Soroban RPC into Postgres, keeping history past RPC's ~7-day retention. |
 | **State reconciler** | Reads each listed asset's `get_supply` and `get_report` back from the coverage ledger and stores anything newer than ingestion has. RPC serves only about seven days of events, so a longer ingestion gap cannot be repaired from events; the contracts always hold the latest figure. Recovered rows are marked `"source": "chain"` and carry no `tx_hash`. Reading is simulation, so it needs no key and runs even on an instance that cannot sign. |
 | **stellar.toml sync** | Resolves each issuer's `home_domain`, reads its SEP-1 `stellar.toml`, and stores the matching `[[CURRENCIES]]` entry, including `attestation_of_reserve`. |
+| **Retention** | Nightly, deletes supply snapshots, reserve reports and unreferenced breakdowns older than `RETENTION_DAYS`, then vacuums the affected tables. `0` keeps everything forever. |
 
 **Live API:** https://plimsoll-indexer.onrender.com/v1/assets  
 **Docs:** https://plimsoll-protocol.gitbook.io/plimsoll-protocol-docs/
@@ -66,9 +67,49 @@ The command fetches the asset's snapshot breakdown from the indexer, verifies th
 | `GET /v1/assets/{sac}/reports?limit=100` | Reserve report history |
 | `GET /v1/reporters` | Active registered reporters |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
+| `POST /graphql` | Optional GraphQL endpoint. Off unless `ENABLE_GRAPHQL=true`; introspection is disabled when `ENVIRONMENT=production`. |
 
 Coverage in the API uses the same selection and rounding rules as the contract
 (`internal/coverage`), so the API and `coverage()` on-chain agree.
+
+### GraphQL
+
+Set `ENABLE_GRAPHQL=true` to mount `/graphql`. The schema covers assets,
+supply snapshots, reports and reporters, so a client can ask for exactly the
+fields it needs instead of receiving the full REST shape:
+
+```bash
+curl localhost:8080/graphql \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"{ assets { sac code supply { amount ledger } coverage { bps tier } } }"}'
+```
+
+`assets(minTier: 3)` filters coverage by tier, and `coverage(minTier: ...)` on
+an individual asset overrides it. Introspection is available in development
+but disabled when `ENVIRONMENT=production`.
+
+### Reindexing from a ledger
+
+If an ingest wrote bad or incomplete history, discard it from a chosen ledger
+and replay from RPC:
+
+```bash
+go run ./cmd/plimsoll-indexer reindex --from-ledger 5034380
+go run ./cmd/plimsoll-indexer reindex --from-ledger 5034380 --dry-run
+```
+
+Reindex deletes asset listings, supply snapshots and reserve reports at or
+after the ledger, resets the ingest cursor, and replays from RPC, logging
+progress every 1 000 ledgers. `--dry-run` prints the row counts without
+deleting anything. Reporters are current state rather than an event log, so
+the replay updates them idempotently instead of deleting them.
+
+### Retention
+
+`RETENTION_DAYS` defaults to `365`; `0` keeps history forever. The nightly
+job deletes older snapshots, reports and breakdowns that no surviving snapshot
+still references, then vacuums the affected tables. It logs the row counts it
+removed.
 
 ## Quick start
 

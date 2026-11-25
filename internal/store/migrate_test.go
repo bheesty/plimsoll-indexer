@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -126,6 +127,20 @@ func appliedVersions(t *testing.T, url string) []int {
 	return v
 }
 
+// embeddedVersions is every migration compiled into the binary, in order.
+func embeddedVersions(t *testing.T) []int {
+	t.Helper()
+	ms, err := loadMigrations(migrationsFS())
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]int, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, m.Version)
+	}
+	return out
+}
+
 func schemaDiff(a, b []string) []string {
 	in := map[string]int{}
 	for _, l := range a {
@@ -151,8 +166,9 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 	if len(want) == 0 {
 		t.Fatal("fresh database has no schema")
 	}
-	if got := appliedVersions(t, fresh); len(got) != 1 || got[0] != 1 {
-		t.Fatalf("fresh database recorded %v, want [1]", got)
+	wantVersions := embeddedVersions(t)
+	if got := appliedVersions(t, fresh); !slices.Equal(got, wantVersions) {
+		t.Fatalf("fresh database recorded %v, want %v", got, wantVersions)
 	}
 
 	for name, schema := range map[string]string{
@@ -175,8 +191,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			if d := schemaDiff(want, schemaOf(t, url)); len(d) > 0 {
 				t.Fatalf("schema differs from a fresh database:\n%s", strings.Join(d, "\n"))
 			}
-			if got := appliedVersions(t, url); len(got) != 1 || got[0] != 1 {
-				t.Fatalf("recorded %v, want [1]", got)
+			if got := appliedVersions(t, url); !slices.Equal(got, wantVersions) {
+				t.Fatalf("recorded %v, want %v", got, wantVersions)
 			}
 			a, err := s.GetAsset(context.Background(), "CSAC")
 			if err != nil || a.Code != "PUSD" {
@@ -197,8 +213,9 @@ func TestReopeningAppliesNothingTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2.Close()
-	if got := appliedVersions(t, url); len(got) != 1 || got[0] != 1 {
-		t.Fatalf("recorded %v, want [1]", got)
+	want := embeddedVersions(t)
+	if got := appliedVersions(t, url); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)
 	}
 }
 
@@ -230,8 +247,9 @@ func TestConcurrentStartsDoNotRace(t *testing.T) {
 	for err := range errs {
 		t.Errorf("concurrent open: %v", err)
 	}
-	if got := appliedVersions(t, url); len(got) != 1 || got[0] != 1 {
-		t.Fatalf("recorded %v, want [1]", got)
+	want := embeddedVersions(t)
+	if got := appliedVersions(t, url); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)
 	}
 }
 

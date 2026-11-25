@@ -220,3 +220,39 @@ func TestOpenAPISpec(t *testing.T) {
 		t.Fatalf("expected openapi 3.1.0 spec, got: %s", string(body))
 	}
 }
+
+func TestGraphQLRouteIsOptional(t *testing.T) {
+	f := &fake{}
+	s := &Server{
+		Store: f,
+		CORS:  []string{"*"},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	resp, err := http.Post(srv.URL+"/graphql", "application/json", strings.NewReader(`{"query":"{__typename}"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	srv.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("disabled /graphql status = %d, want 404", resp.StatusCode)
+	}
+
+	called := false
+	s.GraphQL = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+	srv = httptest.NewServer(s.Handler())
+	resp, err = http.Post(srv.URL+"/graphql", "application/json", strings.NewReader(`{"query":"{__typename}"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	srv.Close()
+	if !called || resp.StatusCode != http.StatusOK {
+		t.Fatalf("enabled /graphql called=%v status=%d", called, resp.StatusCode)
+	}
+}

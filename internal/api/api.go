@@ -48,6 +48,9 @@ type Server struct {
 	CORS    []string
 	Log     *slog.Logger
 	Now     func() time.Time
+	// GraphQL, when set, is mounted at /graphql. It is nil unless
+	// ENABLE_GRAPHQL=true.
+	GraphQL http.Handler
 }
 
 func (s *Server) Handler() http.Handler {
@@ -61,6 +64,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
+	if s.GraphQL != nil {
+		mux.Handle("/graphql", s.GraphQL)
+	}
 	return s.cors(mux)
 }
 
@@ -352,7 +358,8 @@ func (s *Server) cors(next http.Handler) http.Handler {
 				break
 			}
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
