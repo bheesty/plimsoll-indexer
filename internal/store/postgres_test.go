@@ -82,7 +82,7 @@ func freePort() (uint32, error) {
 
 // newDatabase creates an empty database for one test, drops it when the test
 // ends, and returns its URL.
-func newDatabase(t *testing.T) string {
+func newDatabase(t testing.TB) string {
 	t.Helper()
 	if adminURL == "" {
 		t.Skip("embedded postgres is not running (go test -short)")
@@ -113,7 +113,7 @@ func newDatabase(t *testing.T) string {
 
 // openStore opens a Store on a fresh database, applying the schema the way
 // the indexer does on start.
-func openStore(t *testing.T) (*Store, string) {
+func openStore(t testing.TB) (*Store, string) {
 	t.Helper()
 	url := newDatabase(t)
 	s, err := Open(context.Background(), url)
@@ -133,7 +133,7 @@ func portOf(url string) string {
 }
 
 // execSQL runs statements on the database at url outside any Store.
-func execSQL(t *testing.T, url, sql string, args ...any) {
+func execSQL(t testing.TB, url, sql string, args ...any) {
 	t.Helper()
 	conn, err := pgx.Connect(context.Background(), url)
 	if err != nil {
@@ -146,7 +146,7 @@ func execSQL(t *testing.T, url, sql string, args ...any) {
 }
 
 // testPool is a connection pool on the database at url, closed with the test.
-func testPool(t *testing.T, url string) *pgxpool.Pool {
+func testPool(t testing.TB, url string) *pgxpool.Pool {
 	t.Helper()
 	p, err := pgxpool.New(context.Background(), url)
 	if err != nil {
