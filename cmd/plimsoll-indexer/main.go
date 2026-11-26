@@ -18,6 +18,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/keypair"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/api"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/changelog"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/config"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/graphql"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
@@ -182,6 +183,11 @@ func run(cfg config.Config, log *slog.Logger) error {
 		log.Info("graphql enabled", "introspection", !cfg.IsProduction())
 	} else {
 		log.Info("graphql disabled (ENABLE_GRAPHQL not set)")
+	// A malformed changelog would break the published API contract, so refuse
+	// to start rather than serve it.
+	changes, err := changelog.Load()
+	if err != nil {
+		return err
 	}
 
 	srv := &http.Server{
@@ -202,6 +208,10 @@ func run(cfg config.Config, log *slog.Logger) error {
 			Log:     log.With("component", "api"),
 			Now:     time.Now,
 			GraphQL: graphqlHandler,
+			CORS:      cfg.CORSOrigins,
+			Log:       log.With("component", "api"),
+			Now:       time.Now,
+			Changelog: changes,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
